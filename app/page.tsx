@@ -28,8 +28,10 @@ export default function Home() {
   };
 
   const analyzeTechStack = async () => {
-    if (!url) return;
-
+    if (!url) {
+      setError('Please enter a URL!');
+      return;
+    }
     setLoading(true);
     setError('');
     setTechStack(null);
