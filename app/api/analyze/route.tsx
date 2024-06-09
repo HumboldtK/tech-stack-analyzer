@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
 import cheerio from 'cheerio';
+import pLimit from 'p-limit';
 
 interface TechStack {
   cms?: string;
@@ -23,7 +24,8 @@ const serverHeaderMap: Record<string, string> = {
   'express': 'Express.js',
   'php': 'PHP',
   'envoy': 'Envoy',
-  'esf': 'Google Frontend Server'
+  'esf': 'Google Frontend Server',
+  'awselb/2.0' : 'AWS Elastic Load Balancer'
 };
 
 const detectTechStack = async (html: string, headers: Record<string, string>, baseUrl: string): Promise<TechStack> => {
@@ -38,15 +40,27 @@ const detectTechStack = async (html: string, headers: Record<string, string>, ba
 
   // Detecting JavaScript frameworks
   const jsFrameworks = new Set<string>();
-  if (await containsReact($, baseUrl)) jsFrameworks.add('React');
-  if (await containsVue($, baseUrl)) jsFrameworks.add('Vue.js');
-  if (await containsAngular($, baseUrl)) jsFrameworks.add('Angular');
-  if (await containsNextJs($, baseUrl)) jsFrameworks.add('Next.js');
-  if (await containsGatsby($, baseUrl)) jsFrameworks.add('Gatsby');
-  if (await containsSvelte($, baseUrl)) jsFrameworks.add('Svelte');
-  if (await containsEmber($, baseUrl)) jsFrameworks.add('Ember.js');
-  if (await containsNuxtJs($, baseUrl)) jsFrameworks.add('Nuxt.js');
-  if (await containsPolymer($, baseUrl)) jsFrameworks.add('Polymer');
+  const frameworkDetectors = [
+    containsReact($, baseUrl),
+    containsVue($, baseUrl),
+    containsAngular($, baseUrl),
+    containsNextJs($, baseUrl),
+    containsGatsby($, baseUrl),
+    containsSvelte($, baseUrl),
+    containsEmber($, baseUrl),
+    containsNuxtJs($, baseUrl),
+    containsPolymer($, baseUrl)
+  ];
+  const frameworkResults = await Promise.all(frameworkDetectors);
+  if (frameworkResults[0]) jsFrameworks.add('React');
+  if (frameworkResults[1]) jsFrameworks.add('Vue.js');
+  if (frameworkResults[2]) jsFrameworks.add('Angular');
+  if (frameworkResults[3]) jsFrameworks.add('Next.js');
+  if (frameworkResults[4]) jsFrameworks.add('Gatsby');
+  if (frameworkResults[5]) jsFrameworks.add('Svelte');
+  if (frameworkResults[6]) jsFrameworks.add('Ember.js');
+  if (frameworkResults[7]) jsFrameworks.add('Nuxt.js');
+  if (frameworkResults[8]) jsFrameworks.add('Polymer');
   if (jsFrameworks.size > 0) techStack.javascriptFrameworks = Array.from(jsFrameworks);
 
   // Detecting CSS frameworks
@@ -55,6 +69,7 @@ const detectTechStack = async (html: string, headers: Record<string, string>, ba
   if (containsTailwindClasses($)) cssFrameworks.push('Tailwind CSS');
   if (html.includes('bulma')) cssFrameworks.push('Bulma');
   if (html.includes('foundation')) cssFrameworks.push('Foundation');
+  if (await containsMaterialUI($, baseUrl)) cssFrameworks.push('Material-UI');
   if (cssFrameworks.length > 0) techStack.cssFrameworks = cssFrameworks;
 
   // Detecting Analytics
@@ -101,21 +116,26 @@ const detectTechStack = async (html: string, headers: Record<string, string>, ba
 
 const containsInScripts = async ($: cheerio.Root, keyword: string, baseUrl: string, additionalKeywords: string[] = []): Promise<boolean> => {
   const scripts = $('script[src]');
-  for (const script of scripts.toArray()) {
-    const src = $(script).attr('src');
-    if (src) {
-      const absoluteUrl = new URL(src, baseUrl).href;
-      try {
-        const { data } = await axios.get(absoluteUrl);
-        if (data.includes(keyword) || additionalKeywords.some(kw => data.includes(kw))) {
-          return true;
-        }
-      } catch (error) {
-        console.error(`Error fetching script ${absoluteUrl}:`, error);
+  const limit = pLimit(5);
+  const scriptContents = await Promise.all(
+    scripts.toArray().map(script => {
+      const src = $(script).attr('src');
+      if (src) {
+        const absoluteUrl = new URL(src, baseUrl).href;
+        return limit(async () => {
+          try {
+            const { data } = await axios.get(absoluteUrl);
+            return data.includes(keyword) || additionalKeywords.some(kw => data.includes(kw));
+          } catch (error) {
+            console.error(`Error fetching script ${absoluteUrl}:`, error);
+            return false;
+          }
+        });
       }
-    }
-  }
-  return false;
+      return false;
+    })
+  );
+  return scriptContents.some(result => result);
 };
 
 const containsTailwindClasses = ($: cheerio.Root): boolean => {
@@ -124,17 +144,17 @@ const containsTailwindClasses = ($: cheerio.Root): boolean => {
   return $('[class]').toArray().some(el => {
     const classList = $(el).attr('class') || '';
     const tailwindMatches = classList.match(tailwindClassPattern);
-    return tailwindMatches && tailwindMatches.length > 1;
+    return tailwindMatches !== null && tailwindMatches.length > 0;
   });
 };
 
 const containsBootstrap = ($: cheerio.Root): boolean => {
-  const bootstrapClassPattern = /\b(container|row|col|btn|card|alert|badge|breadcrumb|carousel|collapse|dropdown|form|input|modal|nav|navbar|pagination|popover|progress|spinner|toast|tooltip|jumbotron|text-center|d-flex|justify-content-between|align-items-center)\b/;
+  const bootstrapClassPattern = /\b(col-\d+|col-(sm|md|lg|xl|xxl)-\d+|btn|btn-(primary|secondary|success|danger|warning|info|light|dark|link)|card|badge|breadcrumb|carousel|collapse|dropdown|navbar|pagination|popover|spinner|toast|tooltip|jumbotron|text-(left|center|right)|d-(none|inline|inline-block|block|grid|table|table-row|table-cell|flex|inline-flex)|justify-content-(start|end|center|between|around|evenly)|align-items-(start|end|center|baseline|stretch))\b/;
 
   return $('[class]').toArray().some(el => {
     const classList = $(el).attr('class') || '';
     const bootstrapMatches = classList.match(bootstrapClassPattern);
-    return bootstrapMatches && bootstrapMatches.length > 1;
+    return bootstrapMatches !== null && bootstrapMatches.length > 0;
   });
 };
 
@@ -228,6 +248,14 @@ const containsEmber = async ($: cheerio.Root, baseUrl: string): Promise<boolean>
   const isEmberScriptContentPresent = await containsInScripts($, '/ember', baseUrl, ['Ember.Application.create']);
   return isEmberScriptPresent || isEmberScriptContentPresent;
 };
+
+const containsMaterialUI = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
+  const muiScripts = $('script[src*="material-ui"], script[src*="mui"], script[src*="MuiSvgIcon"], script[src*="muiName"]');
+  const isMUIScriptPresent = muiScripts.length > 0;
+  const isMUIScriptContentPresent = await containsInScripts($, 'material-ui', baseUrl, ['@mui', 'MuiSvgIcon', 'muiName']);
+  return isMUIScriptPresent || isMUIScriptContentPresent;
+};
+
 
 export async function POST(req: NextRequest) {
   try {
