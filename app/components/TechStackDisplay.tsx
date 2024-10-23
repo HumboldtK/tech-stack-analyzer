@@ -10,6 +10,7 @@ interface TechStackProps {
     analytics?: string[];
     buildTools?: string[];
     compression?: string[];
+    isWordPress?: boolean;
   };
 }
 
@@ -23,12 +24,12 @@ const TechStackDisplay: React.FC<TechStackProps> = ({ techStack }) => {
             <strong>CMS:</strong> {techStack.cms}
           </div>
         )}
-        {techStack.javascriptFrameworks && (
+        {!techStack.isWordPress && techStack.javascriptFrameworks && (
           <div>
             <strong>JavaScript Frameworks:</strong> {techStack.javascriptFrameworks.join(', ')}
           </div>
         )}
-        {techStack.cssFrameworks && (
+        {!techStack.isWordPress && techStack.cssFrameworks && (
           <div>
             <strong>CSS Frameworks:</strong> {techStack.cssFrameworks.join(', ')}
           </div>
