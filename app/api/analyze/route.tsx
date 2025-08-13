@@ -1,7 +1,10 @@
+// app/api/analyze/route.tsx
 import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
 import cheerio from 'cheerio';
 import pLimit from 'p-limit';
+
+export const runtime = 'nodejs';
 
 interface TechStack {
   cms?: string;
@@ -13,848 +16,759 @@ interface TechStack {
   buildTools?: string[];
   compression?: string[];
   isWordPress?: boolean;
+  cdn?: string[];
+  hosting?: string;
+  payments?: string[];
+  marketing?: string[];
+  monitoring?: string[];
 }
 
-const serverHeaderMap: Record<string, string> = {
-  gws: 'Google Web Server',
-  apache: 'Apache HTTP Server',
-  nginx: 'NGINX',
-  cloudflare: 'Cloudflare',
-  iis: 'Microsoft IIS',
-  'next.js': 'Next.js',
-  express: 'Express.js',
-  php: 'PHP',
-  envoy: 'Envoy',
-  esf: 'Google Frontend Server',
-  'awselb/2.0': 'AWS Elastic Load Balancer',
+const AXIOS_TIMEOUT_MS = 6000;
+const MAX_SCRIPT_REQUESTS = 12;
+const limit = pLimit(6);
+
+const http = axios.create({
+  timeout: AXIOS_TIMEOUT_MS,
+  maxContentLength: 500_000,
+  headers: {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  },
+});
+
+const serverHeaderAliases: Array<[needle: RegExp, label: string]> = [
+  [/gws|ESF|google frontend|google front end|server:\s*ESF/i, 'Google Frontend'],
+  [/apache/i, 'Apache HTTP Server'],
+  [/nginx/i, 'NGINX'],
+  [/cloudflare/i, 'Cloudflare'],
+  [/cloudfront/i, 'Amazon CloudFront'],
+  [/iis|microsoft-iis/i, 'Microsoft IIS'],
+  [/vercel/i, 'Vercel'],
+  [/awselb|elastic load balancer/i, 'AWS Elastic Load Balancer'],
+  [/gunicorn/i, 'Gunicorn'],
+  [/caddy/i, 'Caddy'],
+  [/lighttpd/i, 'lighttpd'],
+  [/fastly/i, 'Fastly (edge)'],
+  [/akamai/i, 'Akamai (edge)'],
+];
+
+const mapServerHeader = (raw?: string): string | undefined => {
+  if (!raw) return undefined;
+  for (const [rx, label] of serverHeaderAliases) {
+    if (rx.test(raw)) return label;
+  }
+  return raw;
 };
 
+// Prefer module scripts and same-origin scripts; cap total
+const pickTopScripts = ($: cheerio.Root, baseUrl: string): string[] => {
+  const baseHost = new URL(baseUrl).host;
+  const nodes = $('script[src],link[rel="preload"][as="script"][href]').toArray();
+  const candidates = nodes
+    .map((el) => {
+      const isLink = $(el).is('link');
+      const srcAttr = isLink ? 'href' : 'src';
+      const raw = ($(el).attr(srcAttr) || '').trim();
+      if (!raw) return null;
+      try {
+        const url = new URL(raw, baseUrl).href;
+        const u = new URL(url);
+        const sameOrigin = u.host === baseHost;
+        const isModule = (($(el).attr('type') || '').toLowerCase() === 'module');
+        const priority = (isModule ? 0 : 1) + (sameOrigin ? 0 : 1);
+        return { url, priority, sameOrigin, isModule };
+      } catch {
+        return null;
+      }
+    })
+    .filter(
+      (x): x is { url: string; priority: number; sameOrigin: boolean; isModule: boolean } => !!x
+    );
+
+  candidates.sort((a, b) => a.priority - b.priority);
+  return candidates.slice(0, MAX_SCRIPT_REQUESTS).map((c) => c.url);
+};
+
+const fetchText = async (url: string): Promise<string | null> => {
+  try {
+    const { data } = await http.get(url);
+    return typeof data === 'string' ? data : JSON.stringify(data);
+  } catch {
+    return null;
+  }
+};
+
+const containsInScripts = async (
+  $: cheerio.Root,
+  baseUrl: string,
+  matcher: (text: string) => boolean
+): Promise<boolean> => {
+  const scriptUrls = pickTopScripts($, baseUrl);
+  const results = await Promise.all(
+    scriptUrls.map((u) =>
+      limit(async () => {
+        const text = await fetchText(u);
+        return text ? matcher(text) : false;
+      })
+    )
+  );
+  return results.some(Boolean);
+};
+
+const dedupeEdgeVsOrigin = (tech: TechStack) => {
+  if (!tech.server) return;
+
+  const ensureCdn = (name: string) => {
+    const list = tech.cdn ?? [];
+    if (!list.some((c) => c.toLowerCase() === name.toLowerCase())) list.push(name);
+    tech.cdn = list;
+  };
+
+  const s = tech.server.toLowerCase();
+
+  // Cloudflare
+  if (s.includes('cloudflare')) {
+    ensureCdn('Cloudflare');
+    tech.server = undefined;
+    return;
+  }
+  // Fastly
+  if (s.includes('fastly')) {
+    ensureCdn('Fastly');
+    tech.server = undefined;
+    return;
+  }
+  // Akamai
+  if (s.includes('akamai')) {
+    ensureCdn('Akamai');
+    tech.server = undefined;
+    return;
+  }
+  // CloudFront
+  if (s.includes('cloudfront')) {
+    ensureCdn('Amazon CloudFront');
+    tech.server = undefined;
+    return;
+  }
+  // Google edge (gws/ESF)
+  if (s.includes('google frontend') || s.includes('gws') || s.includes('esf')) {
+    ensureCdn('Google Frontend');
+    tech.server = undefined;
+    return;
+  }
+  // Vercel: if we already infer Vercel Edge or hosting Vercel, hide "Server: Vercel"
+  if (s.includes('vercel')) {
+    // prefer to show in CDN/hosting buckets
+    if (!(tech.cdn ?? []).some((c) => /vercel/i.test(c))) ensureCdn('Vercel Edge');
+    tech.server = undefined;
+  }
+};
+
+// === Primary analyzer ===
 const detectTechStack = async (
   html: string,
   headers: Record<string, string>,
   baseUrl: string
 ): Promise<TechStack> => {
   const $ = cheerio.load(html);
-  const techStack: TechStack = {};
+  const tech: TechStack = {};
 
-  // Detecting CMS
-  if (isWordPress($)) {
-    techStack.cms = 'WordPress';
-    techStack.isWordPress = true;
-  } else if (isDrupal($)) {
-    techStack.cms = 'Drupal';
-  } else if (isJoomla($)) {
-    techStack.cms = 'Joomla';
-  } else if (isShopify($)) {
-    techStack.cms = 'Shopify';
-  } else if (isSquarespace($)) {
-    techStack.cms = 'Squarespace';
-  } else if (isWix($)) {
-    techStack.cms = 'Wix';
-  } else {
-    const generatorContent = $('meta[name="generator"]').attr('content');
-    if (generatorContent) {
-      techStack.cms = generatorContent;
-    }
-  }
+  // --- CMS ---
+if (isShopify($)) {
+  tech.cms = 'Shopify';
+} else if (isSquarespace($)) {
+  tech.cms = 'Squarespace';
+} else if (isWix($)) {
+  tech.cms = 'Wix';
+} else if (isWordPress($) || (await isWordPressViaAPI(baseUrl))) {
+  tech.cms = 'WordPress';
+  tech.isWordPress = true;
+} else if (isDrupal($)) {
+  tech.cms = 'Drupal';
+} else if (isJoomla($)) {
+  tech.cms = 'Joomla';
+} else {
+  const generatorContent = $('meta[name="generator"]').attr('content');
+  if (generatorContent) tech.cms = generatorContent;
+}
 
-  // Detecting JavaScript frameworks
-  const jsFrameworks = new Set<string>();
-  const frameworkDetectors = [
-    containsReact($, baseUrl),
-    containsVue($, baseUrl),
-    containsAngular($, baseUrl),
-    containsNextJs($, baseUrl),
-    containsGatsby($, baseUrl),
-    containsSvelte($, baseUrl),
-    containsEmber($, baseUrl),
-    containsNuxtJs($, baseUrl),
-    containsPolymer($, baseUrl),
-    containsjQuery($, baseUrl),
-    containsBackbone($, baseUrl),
-    containsDojo($, baseUrl),
-    containsMeteor($, baseUrl),
+
+  // --- JS frameworks ---
+  const jsSet = new Set<string>();
+  const jsDetections: Array<[string, Promise<boolean>]> = [
+    ['React', containsReact($, baseUrl)],
+    ['Vue.js', containsVue($, baseUrl)],
+    ['Angular', containsAngular($, baseUrl)],
+    ['Next.js', containsNextJs($, baseUrl)],
+    ['Gatsby', containsGatsby($, baseUrl)],
+    ['Svelte', containsSvelte($, baseUrl)],
+    ['Ember.js', containsEmber($, baseUrl)],
+    ['Nuxt.js', containsNuxtJs($, baseUrl)],
+    ['Polymer', containsPolymer($, baseUrl)],
+    ['jQuery', containsjQuery($, baseUrl)],
+    ['Backbone.js', containsBackbone($, baseUrl)],
+    ['Dojo', containsDojo($, baseUrl)],
+    ['Meteor', containsMeteor($, baseUrl)],
+    ['Astro', containsAstro($, baseUrl)],
+    ['Remix', containsRemix($, baseUrl)],
+    ['Alpine.js', Promise.resolve(containsAlpine($))],
+    ['HTMX', Promise.resolve(containsHTMX($))],
   ];
-  const frameworkResults = await Promise.all(frameworkDetectors);
-  const frameworkNames = [
-    'React',
-    'Vue.js',
-    'Angular',
-    'Next.js',
-    'Gatsby',
-    'Svelte',
-    'Ember.js',
-    'Nuxt.js',
-    'Polymer',
-    'jQuery',
-    'Backbone.js',
-    'Dojo',
-    'Meteor',
-  ];
-  frameworkResults.forEach((result, index) => {
-    if (result) jsFrameworks.add(frameworkNames[index]);
-  });
-  if (jsFrameworks.size > 0) {
-    techStack.javascriptFrameworks = Array.from(jsFrameworks);
+
+  const jsResults = await Promise.all(jsDetections.map(([, p]) => p));
+  jsResults.forEach((hit, i) => hit && jsSet.add(jsDetections[i][0]));
+  if (jsSet.size) tech.javascriptFrameworks = Array.from(jsSet);
+
+  // --- CSS frameworks (tightened; no more class-only matches) ---
+  if (!tech.isWordPress) {
+    const css: string[] = [];
+    if (containsBootstrap($)) css.push('Bootstrap');
+    if (containsTailwindClasses($)) css.push('Tailwind CSS');
+    if (containsBulma($)) css.push('Bulma');
+    if (containsFoundation($)) css.push('Foundation');
+    if (await containsMaterialUI($, baseUrl)) css.push('Material UI');
+    if (await containsSemanticUI($, baseUrl)) css.push('Semantic UI');
+    if (await containsMaterializeCSS($, baseUrl)) css.push('Materialize CSS');
+    if (css.length) tech.cssFrameworks = css;
   }
 
-  // Detecting CSS frameworks
-  const cssFrameworks = [];
-  if (!techStack.isWordPress) {
-    if (containsBootstrap($)) cssFrameworks.push('Bootstrap');
-    if (containsTailwindClasses($)) cssFrameworks.push('Tailwind CSS');
-    if (containsBulma($)) cssFrameworks.push('Bulma');
-    if (containsFoundation($)) cssFrameworks.push('Foundation');
-    if (await containsMaterialUI($, baseUrl)) cssFrameworks.push('Material-UI');
-    if (await containsSemanticUI($, baseUrl)) cssFrameworks.push('Semantic UI');
-    if (await containsMaterializeCSS($, baseUrl)) cssFrameworks.push('Materialize CSS');
-    if (cssFrameworks.length > 0) techStack.cssFrameworks = cssFrameworks;
-  }
-
-  // Detecting Analytics
-  const analytics = [];
-  if (await containsGoogleAnalytics($, baseUrl)) analytics.push('Google Analytics');
+  // --- Analytics / marketing / monitoring / payments ---
+  const analytics: string[] = [];
+  if (await containsGoogleAnalytics($, baseUrl)) analytics.push('Google Analytics / gtag.js');
   if (await containsGoogleTagManager($, baseUrl)) analytics.push('Google Tag Manager');
   if (await containsMatomo($, baseUrl)) analytics.push('Matomo');
   if (await containsPlausible($, baseUrl)) analytics.push('Plausible');
   if (await containsMixpanel($, baseUrl)) analytics.push('Mixpanel');
   if (await containsAmplitude($, baseUrl)) analytics.push('Amplitude');
-  if (analytics.length > 0) techStack.analytics = analytics;
+  if (await containsSegment($, baseUrl)) analytics.push('Segment');
+  if (analytics.length) tech.analytics = analytics;
 
-  // Detecting Build Tools
-  const buildTools = new Set<string>();
-  if (html.includes('webpack')) buildTools.add('Webpack');
-  if (await containsInScripts($, 'webpack', baseUrl)) buildTools.add('Webpack');
-  if (html.includes('gulp')) buildTools.add('Gulp');
-  if (html.includes('grunt')) buildTools.add('Grunt');
-  if (buildTools.size > 0) techStack.buildTools = Array.from(buildTools);
+  const marketing: string[] = [];
+  if (containsHubspot($)) marketing.push('HubSpot');
+  if (containsMailchimp($)) marketing.push('Mailchimp');
+  if (containsIntercom($)) marketing.push('Intercom');
+  if (containsDrift($)) marketing.push('Drift');
+  if (containsHotjar($)) marketing.push('Hotjar');
+  if (marketing.length) tech.marketing = marketing;
 
-  // Detecting Compression
-  const compression = [];
-  if (headers['content-encoding']?.includes('gzip')) compression.push('Gzip');
-  if (headers['content-encoding']?.includes('br')) compression.push('Brotli');
-  if (headers['content-encoding']?.includes('deflate')) compression.push('Deflate');
-  if (compression.length > 0) techStack.compression = compression;
+  const monitoring: string[] = [];
+  if (containsSentry($)) monitoring.push('Sentry');
+  if (containsDatadog($)) monitoring.push('Datadog RUM');
+  if (containsNewRelic($)) monitoring.push('New Relic');
+  if (monitoring.length) tech.monitoring = monitoring;
 
-  // Detecting Server
-  if (headers['server']) {
-    const serverName = headers['server'].toLowerCase();
-    techStack.server = serverHeaderMap[serverName] || headers['server'];
-  }
+  const payments: string[] = [];
+  if (containsStripe($)) payments.push('Stripe');
+  if (containsBraintree($)) payments.push('Braintree');
+  if (containsPaypal($)) payments.push('PayPal');
+  if (payments.length) tech.payments = payments;
 
-  // Detecting Web Server
+  // --- Build tools ---
+  const build = new Set<string>();
+  const lowerHtml = html.toLowerCase();
+  const addIf = (cond: boolean, label: string) => cond && build.add(label);
+
+  addIf(lowerHtml.includes('webpack'), 'Webpack');
+  addIf(lowerHtml.includes('gulp'), 'Gulp');
+  addIf(lowerHtml.includes('grunt'), 'Grunt');
+
+  if (await containsInScripts($, baseUrl, (t) => /vite|import\.meta/.test(t))) build.add('Vite');
+  if (await containsInScripts($, baseUrl, (t) => /parcelRequire/.test(t))) build.add('Parcel');
+  if (await containsInScripts($, baseUrl, (t) => /__ROLLUP__|rollup/i.test(t))) build.add('Rollup');
+
+  if (build.size) tech.buildTools = Array.from(build);
+
+  // --- Compression ---
+  const enc = (headers['content-encoding'] || '').toLowerCase();
+  const compression: string[] = [];
+  if (enc.includes('br')) compression.push('Brotli');
+  if (enc.includes('gzip')) compression.push('Gzip');
+  if (enc.includes('deflate')) compression.push('Deflate');
+  if (compression.length) tech.compression = compression;
+
+  // --- Server / web platform ---
+  if (headers['server']) tech.server = mapServerHeader(headers['server']) || headers['server'];
   if (headers['x-powered-by']) {
-    const xPoweredBy = headers['x-powered-by'].toLowerCase();
-    if (
-      !techStack.javascriptFrameworks?.includes('Next.js') &&
-      !techStack.javascriptFrameworks?.includes('Nuxt.js')
-    ) {
-      techStack.webServer = headers['x-powered-by'];
-    } else if (
-      xPoweredBy.includes('next.js') &&
-      !techStack.javascriptFrameworks?.includes('Next.js')
-    ) {
-      techStack.javascriptFrameworks?.push('Next.js');
-    } else if (
-      xPoweredBy.includes('nuxt.js') &&
-      !techStack.javascriptFrameworks?.includes('Nuxt.js')
-    ) {
-      techStack.javascriptFrameworks?.push('Nuxt.js');
-    }
+    const xp = headers['x-powered-by'].toLowerCase();
+    if (xp.includes('next.js')) jsSet.add('Next.js');
+    if (xp.includes('nuxt.js')) jsSet.add('Nuxt.js');
+    if (!/next\.js|nuxt\.js/.test(xp)) tech.webServer = headers['x-powered-by'];
   }
+  if (jsSet.size) tech.javascriptFrameworks = Array.from(jsSet);
 
-  return techStack;
+  // --- CDN / Hosting inference from headers ---
+  const cdn = inferCDN(headers);
+  if (cdn.length) tech.cdn = cdn;
+  const hosting = inferHosting(headers);
+  if (hosting) tech.hosting = hosting;
+
+  dedupeEdgeVsOrigin(tech);
+
+  return tech;
 };
 
-// CMS Detection Functions
+
+// ======= CMS detection =======
 const isWordPress = ($: cheerio.Root): boolean => {
-  const patterns = [
-    /\/wp-content\//,
-    /\/wp-includes\//,
-    /\/wp-admin\//,
-    /wp-embed\.min\.js/,
-    /wp-emoji-release\.min\.js/,
-    /wp-blog-header\.php/,
-    /rel="https:\/\/api\.w\.org\/"/,
-    /<link rel='https:\/\/api\.w\.org\/'/,
+  const html = $.html();
+
+  const signals: RegExp[] = [
+    /\/wp-content\//i,
+    /\/wp-includes\//i,
+    /\/wp-admin\//i,
+    /wp-embed(?:\.min)?\.js/i,
+    /wp-emoji-release(?:\.min)?\.js/i,
+    /wp-blog-header\.php/i,
+    /<meta[^>]+name=["']generator["'][^>]+content=["'][^"']*wordpress/i,
+    /rel=["']https:\/\/api\.w\.org\/["']/i,
   ];
-  const html = $.html().toLowerCase();
-  const matches = patterns.filter((pattern) => pattern.test(html));
-  return matches.length >= 1;
+
+  let score = 0;
+  for (const rx of signals) if (rx.test(html)) score++;
+  return score >= 2;
 };
+
+const isWordPressViaAPI = async (baseUrl: string): Promise<boolean> => {
+  try {
+    const u = new URL('/wp-json', baseUrl).href;
+    const res = await http.get(u, {
+      validateStatus: () => true,
+      headers: { Accept: 'application/json' },
+      maxRedirects: 2,
+    });
+
+    if (res.status < 200 || res.status >= 300) return false;
+    const ct = String(res.headers['content-type'] || '').toLowerCase();
+    if (!ct.includes('application/json')) return false;
+
+    const data = res.data;
+    if (!data || typeof data !== 'object') return false;
+
+    const hasNamespaces = Array.isArray((data as any).namespaces);
+    const hasRoutes =
+      data && typeof (data as any).routes === 'object' && (data as any).routes !== null &&
+      Object.keys((data as any).routes).length > 0;
+
+    const hasWpHeader = Object.keys(res.headers).some((h) => h.toLowerCase().startsWith('x-wp-'));
+
+    return (hasNamespaces && hasRoutes) || hasWpHeader;
+  } catch {
+    return false;
+  }
+};
+
 
 const isDrupal = ($: cheerio.Root): boolean => {
-  const patterns = [/drupal\.js/, /sites\/all\//, /drupal_settings/];
   const html = $.html().toLowerCase();
-  const matches = patterns.filter((pattern) => pattern.test(html));
-  return matches.length >= 2;
+  const patterns = [/drupal\.js/i, /sites\/(default|all)\//i, /drupal_settings|drupalSettings/i];
+  return patterns.filter((rx) => rx.test(html)).length >= 2;
 };
 
 const isJoomla = ($: cheerio.Root): boolean => {
-  const patterns = [/joomla/, /\/components\/com_/, /\/media\/system\/js\//];
   const html = $.html().toLowerCase();
-  const matches = patterns.filter((pattern) => pattern.test(html));
-  return matches.length >= 2;
+  const patterns = [/joomla/i, /\/components\/com_/i, /\/media\/system\/js\//i];
+  return patterns.filter((rx) => rx.test(html)).length >= 2;
 };
 
 const isShopify = ($: cheerio.Root): boolean => {
-  const patterns = [/cdn\.shopify\.com/, /shopify\.assets/, /shopify/];
-  const html = $.html().toLowerCase();
-  const matches = patterns.filter((pattern) => pattern.test(html));
-  return matches.length >= 2;
+  const html = $.html();
+  const signals: RegExp[] = [
+    /cdn\.shopify\.com/i,
+    /shopifycloud/i,
+    /data-shopify/i,
+    /window\.Shopify/i,
+    /shopify\.assets/i,
+  ];
+  let score = 0;
+  for (const rx of signals) if (rx.test(html)) score++;
+  return score >= 2;
 };
 
+
 const isSquarespace = ($: cheerio.Root): boolean => {
-  const patterns = [/static\.squarespace\.com/, /squarespace\.analytics/];
   const html = $.html().toLowerCase();
-  const matches = patterns.filter((pattern) => pattern.test(html));
-  return matches.length >= 2;
+  const patterns = [/static\.squarespace\.com/i, /squarespace\.analytics/i];
+  return patterns.filter((rx) => rx.test(html)).length >= 1;
 };
 
 const isWix = ($: cheerio.Root): boolean => {
-  const patterns = [/static\.wixstatic\.com/, /wix-code/, /wix\.apps/];
   const html = $.html().toLowerCase();
-  const matches = patterns.filter((pattern) => pattern.test(html));
-  return matches.length >= 2;
+  const patterns = [/static\.wixstatic\.com/i, /wix-code|wixsite/i, /wix\.apps/i];
+  return patterns.filter((rx) => rx.test(html)).length >= 2;
 };
 
-// Analytics Detection Functions
+// ======= Analytics / marketing / monitoring / payments =======
 const containsGoogleAnalytics = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const gaScript = $(
-    'script[src*="google-analytics.com/analytics.js"], script[src*="google-analytics.com/ga.js"], script[src*="googletagmanager.com/gtag/js"]'
-  );
+  const gaScript = $('script[src*="google-analytics.com/analytics.js"], script[src*="google-analytics.com/ga.js"], script[src*="googletagmanager.com/gtag/js"]');
   const hasGAScript = gaScript.length > 0;
 
-  const inlineScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
+  const inline = $('script').filter((i, el) => {
+    const c = $(el).html() || '';
+    const ua = /ga\((['"])create\1/.test(c) && /ga\((['"])send\1/.test(c);
+    const gtag = /gtag\(/.test(c) && /config/.test(c) && /(UA-|G-)/.test(c);
+    return ua || gtag;
+  }).length > 0;
 
-    const isUniversalAnalytics =
-      scriptContent.includes('ga(') &&
-      (scriptContent.includes("ga('create'") ||
-        scriptContent.includes('ga("create"') ||
-        scriptContent.includes("ga('create'")) &&
-      (scriptContent.includes("ga('send'") ||
-        scriptContent.includes('ga("send"') ||
-        scriptContent.includes("ga('send'"));
-
-    const isGlobalSiteTag =
-      scriptContent.includes('gtag(') &&
-      scriptContent.includes('config') &&
-      (scriptContent.includes('UA-') || scriptContent.includes('G-'));
-
-    return isUniversalAnalytics || isGlobalSiteTag;
-  });
-  const hasInlineGA = inlineScripts.length > 0;
-
-  const foundInScripts = await containsInScripts($, 'google-analytics', baseUrl, ['ga(', 'gtag(']);
-
-  const conditions = [hasGAScript, hasInlineGA, foundInScripts];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 1;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /gtag\(|ga\(/.test(t));
+  return hasGAScript || inline || inScripts;
 };
 
 const containsGoogleTagManager = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const gtmScript = $('script[src*="googletagmanager.com/gtm.js?id="]');
-  const hasGTMScript = gtmScript.length > 0 && gtmScript.attr('src')?.includes('id=GTM-');
-
-  const inlineScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return (
-      scriptContent.includes('dataLayer') &&
-      scriptContent.includes('gtm.start') &&
-      scriptContent.includes('GTM-')
-    );
-  });
-  const hasInlineGTM = inlineScripts.length > 0;
-
-  const foundInScripts = await containsInScripts($, 'gtm.start', baseUrl, ['GTM-']);
-
-  const conditions = [hasGTMScript, hasInlineGTM, foundInScripts];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 1;
+  const gtmScript = $('script[src*="googletagmanager.com/gtm.js"]');
+  const has = gtmScript.length > 0 || $('noscript iframe[src*="googletagmanager.com/ns.html"]').length > 0;
+  const inline = $('script').filter((i, el) => /dataLayer/.test($(el).html() || '') && /GTM-/.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /gtm\.start|GTM-/.test(t));
+  return has || inline || inScripts;
 };
 
 const containsMatomo = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const matomoScripts = $('script[src*="matomo"]');
-  const hasMatomoScript = matomoScripts.length > 0;
-
-  const inlineMatomoScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('Matomo') || scriptContent.includes('_paq.push');
-  });
-  const hasInlineMatomo = inlineMatomoScripts.length > 0;
-
-  const foundInScripts = await containsInScripts($, 'matomo', baseUrl, ['_paq.push']);
-
-  const conditions = [hasMatomoScript, hasInlineMatomo, foundInScripts];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const s = $('script[src*="matomo"], script[src*="piwik"]');
+  const inline = $('script').filter((i, el) => /_paq\.push|Matomo/i.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /_paq\.push|Matomo/i.test(t));
+  return (s.length > 0 ? 1 : 0) + (inline ? 1 : 0) + (inScripts ? 1 : 0) >= 2;
 };
 
 const containsPlausible = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const plausibleScripts = $('script[src*="plausible.io"]');
-  const hasPlausibleScript = plausibleScripts.length > 0;
-
-  const inlinePlausibleScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('plausible') || scriptContent.includes('data-domain');
-  });
-  const hasInlinePlausible = inlinePlausibleScripts.length > 0;
-
-  const foundInScripts = await containsInScripts($, 'plausible', baseUrl);
-
-  const conditions = [hasPlausibleScript, hasInlinePlausible, foundInScripts];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const s = $('script[src*="plausible.io"]');
+  const inline = $('script').filter((i, el) => /plausible|data-domain/i.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /plausible/i.test(t));
+  return (s.length > 0 ? 1 : 0) + (inline ? 1 : 0) + (inScripts ? 1 : 0) >= 2;
 };
 
 const containsMixpanel = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const mixpanelScripts = $('script[src*="mixpanel"]');
-  const hasMixpanelScript = mixpanelScripts.length > 0;
-
-  const inlineMixpanelScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('mixpanel') || scriptContent.includes('mixpanel.init');
-  });
-  const hasInlineMixpanel = inlineMixpanelScripts.length > 0;
-
-  const foundInScripts = await containsInScripts($, 'mixpanel', baseUrl);
-
-  const conditions = [hasMixpanelScript, hasInlineMixpanel, foundInScripts];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const s = $('script[src*="mixpanel"]');
+  const inline = $('script').filter((i, el) => /mixpanel(\.init|\.)/i.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /mixpanel/i.test(t));
+  return (s.length > 0 ? 1 : 0) + (inline ? 1 : 0) + (inScripts ? 1 : 0) >= 2;
 };
 
 const containsAmplitude = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const amplitudeScript = $('script[src*="amplitude.com"]');
-  const hasAmplitudeScript = amplitudeScript.length > 0;
-
-  const inlineScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('amplitude.getInstance().init');
-  });
-  const hasInlineAmplitude = inlineScripts.length > 0;
-
-  const foundInScripts = await containsInScripts($, 'amplitude.getInstance().init', baseUrl);
-
-  const conditions = [hasAmplitudeScript, hasInlineAmplitude, foundInScripts];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const s = $('script[src*="amplitude.com"]');
+  const inline = $('script').filter((i, el) => /amplitude\.getInstance\(\)\.init/.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /amplitude\.getInstance\(\)\.init/.test(t));
+  return (s.length > 0 ? 1 : 0) + (inline ? 1 : 0) + (inScripts ? 1 : 0) >= 2;
 };
 
-// JavaScript Framework Detection Functions
+const containsSegment = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
+  const s = $('script[src*="segment.com"], script[src*="cdn.segment.com"]');
+  const inScripts = await containsInScripts($, baseUrl, (t) => /analytics\.load|SegmentSnip/i.test(t));
+  return s.length > 0 || inScripts;
+};
+
+const containsHotjar = ($: cheerio.Root): boolean => {
+  return $('script[src*="static.hotjar.com"], script[src*="script.hotjar.com"]').length > 0 ||
+    $('script').filter((i, el) => /hjid|Hotjar/i.test($(el).html() || '')).length > 0;
+};
+
+const containsHubspot = ($: cheerio.Root): boolean => {
+  return $('script[src*="js.hs-scripts.com"], script[src*="js.hs-analytics.net"]').length > 0;
+};
+
+const containsMailchimp = ($: cheerio.Root): boolean => {
+  return $('script[src*="chimpstatic.com"], script[src*="mcjs"], script[src*="list-manage.com"]').length > 0;
+};
+
+const containsIntercom = ($: cheerio.Root): boolean => {
+  return $('script[src*="widget.intercom.io"]').length > 0 || $('script').filter((i, el) => /intercomSettings/i.test($(el).html() || '')).length > 0;
+};
+
+const containsDrift = ($: cheerio.Root): boolean => {
+  return $('script[src*="js.driftt.com"]').length > 0;
+};
+
+const containsSentry = ($: cheerio.Root): boolean => {
+  return $('script[src*="sentry.io"], script[src*="@sentry"]').length > 0 ||
+    $('script').filter((i, el) => /Sentry\.init|@sentry\/browser/i.test($(el).html() || '')).length > 0;
+};
+
+const containsDatadog = ($: cheerio.Root): boolean => {
+  return $('script[src*="datadoghq"], script[src*="ddrum"]').length > 0;
+};
+
+const containsNewRelic = ($: cheerio.Root): boolean => {
+  return $('script[src*="nr-data.net"], script[src*="newrelic"]').length > 0;
+};
+
+const containsStripe = ($: cheerio.Root): boolean => $('script[src*="js.stripe.com"]').length > 0;
+const containsBraintree = ($: cheerio.Root): boolean => $('script[src*="braintree"], script[src*="paypalobjects.com/api/checkout"]').length > 0;
+const containsPaypal = ($: cheerio.Root): boolean => $('script[src*="paypal.com/sdk/js"], script[src*="paypalobjects.com"]').length > 0;
+
+// ======= JS frameworks =======
 const containsjQuery = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const jqueryScripts = $('script[src*="jquery"]');
-  const isjQueryPresent = jqueryScripts.length > 0;
-
-  const inlinejQueryScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('jQuery') || scriptContent.includes('$(');
-  });
-  const isInlinejQueryPresent = inlinejQueryScripts.length > 0;
-
-  const isjQueryContentPresent = await containsInScripts($, 'jQuery', baseUrl, ['$(', '$.']);
-
-  const conditions = [isjQueryPresent, isInlinejQueryPresent, isjQueryContentPresent];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTag = $('script[src*="jquery"]').length > 0;
+  const inline = $('script').filter((i, el) => {
+    const c = $(el).html() || '';
+    return /jQuery|\$\(/.test(c);
+  }).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /jQuery|\$\(/.test(t));
+  return (hasTag ? 1 : 0) + (inline ? 1 : 0) + (inScripts ? 1 : 0) >= 2;
 };
 
 const containsBackbone = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const backboneScripts = $('script[src*="backbone"]');
-  const isBackbonePresent = backboneScripts.length > 0;
-
-  const inlineBackboneScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('Backbone') || scriptContent.includes('Backbone.Model');
-  });
-  const isInlineBackbonePresent = inlineBackboneScripts.length > 0;
-
-  const isBackboneContentPresent = await containsInScripts($, 'Backbone', baseUrl);
-
-  const conditions = [isBackbonePresent, isInlineBackbonePresent, isBackboneContentPresent];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTag = $('script[src*="backbone"]').length > 0;
+  const inline = $('script').filter((i, el) => /Backbone\.Model|Backbone\./.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /Backbone\./.test(t));
+  return (hasTag ? 1 : 0) + (inline ? 1 : 0) + (inScripts ? 1 : 0) >= 2;
 };
 
 const containsDojo = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const dojoScripts = $('script[src*="dojo"]');
-  const isDojoPresent = dojoScripts.length > 0;
-
-  const inlineDojoScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('dojo') || scriptContent.includes('dojo.require');
-  });
-  const isInlineDojoPresent = inlineDojoScripts.length > 0;
-
-  const isDojoContentPresent = await containsInScripts($, 'dojo', baseUrl);
-
-  const conditions = [isDojoPresent, isInlineDojoPresent, isDojoContentPresent];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTag = $('script[src*="dojo"]').length > 0;
+  const inline = $('script').filter((i, el) => /dojo\.require|dojo\./.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /dojo\./i.test(t));
+  return (hasTag ? 1 : 0) + (inline ? 1 : 0) + (inScripts ? 1 : 0) >= 2;
 };
 
 const containsMeteor = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const meteorScripts = $('script[src*="meteor"], script[src*="packages/meteor"]');
-  const isMeteorPresent = meteorScripts.length > 0;
-
-  const inlineMeteorScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('Meteor') || scriptContent.includes('Meteor.startup');
-  });
-  const isInlineMeteorPresent = inlineMeteorScripts.length > 0;
-
-  const hasMeteorAttributes = $('[id^="meteor"]').length > 0;
-
-  const isMeteorContentPresent = await containsInScripts($, 'Meteor', baseUrl);
-
-  const conditions = [
-    isMeteorPresent,
-    isInlineMeteorPresent,
-    hasMeteorAttributes,
-    isMeteorContentPresent,
-  ];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTag = $('script[src*="meteor"], script[src*="packages/meteor"]').length > 0;
+  const inline = $('script').filter((i, el) => /Meteor\.startup|Meteor\./.test($(el).html() || '')).length > 0;
+  const hasAttr = $('[id^="meteor"]').length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /Meteor\./.test(t));
+  return (hasTag ? 1 : 0) + (inline ? 1 : 0) + (hasAttr ? 1 : 0) + (inScripts ? 1 : 0) >= 2;
 };
 
-// CSS Framework Detection Functions
+// ======= CSS Frameworks (tight rules) =======
+
+// Bootstrap
+const containsBootstrap = ($: cheerio.Root): boolean => {
+  const hasStylesheet =
+    $('link[rel~="stylesheet"][href*="bootstrap"]' +
+      ',link[href*="cdnjs.cloudflare.com/ajax/libs/bootstrap"]' +
+      ',link[href*="cdn.jsdelivr.net/npm/bootstrap"]' +
+      ',link[href*="maxcdn.bootstrapcdn.com/bootstrap"]' +
+      ',link[href*="unpkg.com/bootstrap"]').length > 0;
+
+  const hasScript =
+    $('script[src*="bootstrap.bundle"]' +
+      ',script[src*="bootstrap.min.js"]' +
+      ',script[src*="cdnjs.cloudflare.com/ajax/libs/bootstrap"]' +
+      ',script[src*="cdn.jsdelivr.net/npm/bootstrap"]' +
+      ',script[src*="maxcdn.bootstrapcdn.com/bootstrap"]' +
+      ',script[src*="unpkg.com/bootstrap"]').length > 0;
+
+  const hasBsVars =
+    $('style')
+      .toArray()
+      .some((el) => /--bs-/.test($(el).html() || '')) ||
+    $('[style]')
+      .toArray()
+      .some((el) => /--bs-/.test($(el).attr('style') || ''));
+
+  const dataBsCount = $(
+    '[data-bs-toggle], [data-bs-target], [data-bs-dismiss], [data-bs-spy], [data-bs-slide]'
+  ).length;
+
+  if (hasStylesheet || hasScript || hasBsVars) return true;
+  if (dataBsCount >= 2 && (hasStylesheet || hasScript || hasBsVars)) return true;
+
+  return false;
+};
+
+// Bulma: require stylesheet link OR combination of Bulma-specific “is-/has-” + grid components.
+const containsBulma = ($: cheerio.Root): boolean => {
+  const hasLink =
+    $('link[href*="bulma.min.css"], link[href*="bulma.css"], link[href*="cdn.jsdelivr.net/npm/bulma"]').length > 0;
+
+  const gridBits = $('.columns, .column, .hero, .notification, .level, .tile, .message, .navbar').length;
+  const modifierBits = $('[class*=" is-"], [class^="is-"], [class*=" has-"], [class^="has-"]').length;
+
+  // Need enough of both to avoid generic class false-positives
+  return hasLink || (gridBits >= 3 && modifierBits >= 4);
+};
+
+// Foundation: require CSS/JS link OR distinctive data-attributes OR modern grid classes (grid-x/cell) with JS.
+const containsFoundation = ($: cheerio.Root): boolean => {
+  const hasLink =
+    $('link[href*="foundation.min.css"], link[href*="foundation.css"], link[href*="foundation-sites"]').length > 0;
+  const hasJs =
+    $('script[src*="foundation.min.js"], script[src*="foundation.js"]').length > 0;
+
+  const hasDataAttrs = $(
+    '[data-accordion], [data-dropdown], [data-reveal], [data-tabs], [data-off-canvas], [data-sticky], [data-magellan]'
+  ).length > 0;
+
+  const modernGrid = $('.grid-x, .cell, .grid-container, .callout, .reveal').length >= 3;
+
+  return hasLink || hasDataAttrs || (hasJs && modernGrid);
+};
+
 const containsMaterializeCSS = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const materializeScripts = $('link[href*="materialize"], script[src*="materialize"]');
-  const isMaterializePresent = materializeScripts.length > 0;
-
-  const inlineMaterialize = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('M.AutoInit') || scriptContent.includes('M.toast');
-  });
-  const hasInlineMaterialize = inlineMaterialize.length > 0;
-
-  const isMaterializeContentPresent = await containsInScripts($, 'materialize', baseUrl);
-
-  const conditions = [isMaterializePresent, hasInlineMaterialize, isMaterializeContentPresent];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTag = $('link[href*="materialize"], script[src*="materialize"]').length > 0;
+  const inline = $('script').filter((i, el) => /M\.AutoInit|M\.toast/.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /materialize|M\.AutoInit/.test(t));
+  return hasTag || (inline && inScripts);
 };
 
 const containsSemanticUI = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const semanticUIScripts = $('link[href*="semantic"], script[src*="semantic"]');
-  const isSemanticUIPresent = semanticUIScripts.length > 0;
-
-  const inlineSemanticUI = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('$.fn.dropdown') || scriptContent.includes('$.fn.modal');
-  });
-  const hasInlineSemanticUI = inlineSemanticUI.length > 0;
-
-  const isSemanticUIContentPresent = await containsInScripts($, 'semantic', baseUrl);
-
-  const conditions = [isSemanticUIPresent, hasInlineSemanticUI, isSemanticUIContentPresent];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasLink = $('link[href*="semantic"], link[href*="semantic-ui"]').length > 0;
+  const hasScript = $('script[src*="semantic"]').length > 0;
+  const inline = $('script').filter((i, el) => /\$\.fn\.dropdown|\$\.fn\.modal/.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /semantic/i.test(t));
+  return hasLink || hasScript || (inline && inScripts);
 };
 
-// Existing Detection Functions (adjusted for improved accuracy)
-const containsInScripts = async (
-  $: cheerio.Root,
-  keyword: string,
-  baseUrl: string,
-  additionalKeywords: string[] = []
-): Promise<boolean> => {
-  const scripts = $('script[src]');
-  const limit = pLimit(5);
-  const scriptContents = await Promise.all(
-    scripts
-      .toArray()
-      .map((script) => {
-        const src = $(script).attr('src');
-        if (src) {
-          const absoluteUrl = new URL(src, baseUrl).href;
-          return limit(async () => {
-            try {
-              const { data } = await axios.get(absoluteUrl);
-              return (
-                data.includes(keyword) ||
-                additionalKeywords.some((kw) => data.includes(kw))
-              );
-            } catch (error) {
-              console.error(`Error fetching script ${absoluteUrl}:`, error);
-              return false;
-            }
-          });
-        }
-        return false;
-      })
-  );
-  return scriptContents.some((result) => result);
-};
-
+// Tailwind can stay a bit permissive (utility class soup is distinctive) but still check stylesheet too.
 const containsTailwindClasses = ($: cheerio.Root): boolean => {
-  const tailwindClassPattern =
-    /\b(bg-(red|blue|green|yellow|indigo|purple|pink|gray|white|black|transparent|current)-(50|100|200|300|400|500|600|700|800|900)|text-(xs|sm|base|lg|xl|2xl|3xl|4xl|5xl|6xl|7xl|8xl|9xl|left|center|right|justify|opacity-\d{1,3})|rounded(-\w+)?|shadow(-\w+)?|p-\d+|m-\d+|w-\d\/\d|h-\d+|inline-flex|flex|flex-(row|col)|items-(start|end|center|baseline|stretch)|justify-(start|end|center|between|around|evenly)|gap-\d+|space-(x|y)-\d+)\b/;
-
-  const matchesTailwindClass = $('[class]')
-    .toArray()
-    .some((el) => {
-      const classList = $(el).attr('class') || '';
-      const tailwindMatches = classList.match(tailwindClassPattern);
-      return tailwindMatches !== null && tailwindMatches.length > 0;
-    });
-
+  const rx =
+    /\b(bg-(?:red|blue|green|yellow|indigo|purple|pink|gray|white|black|transparent|current)-(?:50|100|200|300|400|500|600|700|800|900)|text-(?:xs|sm|base|lg|xl|2xl|3xl|4xl|5xl|6xl|left|center|right|justify)|rounded(?:-\w+)?|shadow(?:-\w+)?|p-\d+|m-\d+|w-\d\/\d|h-\d+|inline-flex|flex|flex-(?:row|col)|items-(?:start|end|center|baseline|stretch)|justify-(?:start|end|center|between|around|evenly)|gap-\d+|space-(?:x|y)-\d+)\b/;
+  const matchesClasses = $('[class]').toArray().some((el) => rx.test($(el).attr('class') || ''));
   const tailwindCss = $('link[href*="tailwind.css"], link[href*="tailwind.min.css"]').length > 0;
-
-  const conditions = [matchesTailwindClass, tailwindCss];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  return matchesClasses && tailwindCss ? true : matchesClasses && $('[class*="flex "]').length > 5;
 };
 
-const containsBootstrap = ($: cheerio.Root): boolean => {
-  const bootstrapClassPattern =
-    /\b((col-(xs|sm|md|lg|xl|xxl)-\d+)|(btn-(primary|secondary|success|danger|warning|info|light|dark|link))|navbar|breadcrumb|carousel|collapse|dropdown|modal|alert|badge|spinner|progress|toast|tooltip|jumbotron|pagination|popover|d-(none|inline|block|flex|grid|table)|justify-content-(start|end|center|between|around)|align-items-(start|end|center|stretch))\b/;
-
-  const matchesBootstrapClass = $('[class]')
-    .toArray()
-    .some((el) => {
-      const classList = $(el).attr('class') || '';
-      const bootstrapMatches = classList.match(bootstrapClassPattern);
-      return bootstrapMatches !== null && bootstrapMatches.length > 0;
-    });
-
-  const bootstrapCss = $('link[href*="bootstrap.min.css"], link[href*="bootstrap.css"]').length > 0;
-  const bootstrapJs = $('script[src*="bootstrap.min.js"], script[src*="bootstrap.js"]').length > 0;
-
-  const conditions = [matchesBootstrapClass, bootstrapCss, bootstrapJs];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
-};
-
-const containsBulma = ($: cheerio.Root): boolean => {
-  const bulmaCss = $('link[href*="bulma.css"], link[href*="bulma.min.css"]').length > 0;
-
-  const bulmaClassPattern = /\b(container|notification|button|columns|column|is-\w+|has-\w+)\b/;
-
-  const matchesBulmaClass = $('[class]')
-    .toArray()
-    .some((el) => {
-      const classList = $(el).attr('class') || '';
-      const bulmaMatches = classList.match(bulmaClassPattern);
-      return bulmaMatches !== null && bulmaMatches.length > 0;
-    });
-
-  const conditions = [bulmaCss, matchesBulmaClass];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
-};
-
-const containsFoundation = ($: cheerio.Root): boolean => {
-  const foundationCss = $('link[href*="foundation.css"], link[href*="foundation.min.css"]').length > 0;
-
-  const foundationClassPattern = /\b(row|column|columns|button|alert-box|radius|round|has-\w+)\b/;
-
-  const matchesFoundationClass = $('[class]')
-    .toArray()
-    .some((el) => {
-      const classList = $(el).attr('class') || '';
-      const foundationMatches = classList.match(foundationClassPattern);
-      return foundationMatches !== null && foundationMatches.length > 0;
-    });
-
-  const conditions = [foundationCss, matchesFoundationClass];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
-};
-
+// ======= Next/React/etc (unchanged) =======
 const containsNextJs = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const scripts = $('script[src*="/_next/static/"]');
-  const inlineScripts = $('script').filter(
-    (i, el) => $(el).html()?.includes('__NEXT_DATA__') ?? false
-  );
-  const isNextScriptPresent = scripts.length > 0 || inlineScripts.length > 0;
-  const isNextScriptContentPresent = await containsInScripts($, '/_next/static/', baseUrl);
-
-  const hasNextData = $('script#__NEXT_DATA__').length > 0;
-
-  const conditions = [isNextScriptPresent, isNextScriptContentPresent, hasNextData];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTags = $('script[src*="/_next/static/"]').length > 0 || $('script#__NEXT_DATA__').length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /\/_next\/static\/|__NEXT_DATA__/.test(t));
+  const announcer = $('[aria-live="assertive"][id^="__next"]').length > 0 || $('[data-nextjs-router]').length > 0;
+  return hasTags || inScripts || announcer;
 };
 
 const containsReact = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const hasDataReactAttribute = $('[data-reactroot], [data-reactid]').length > 0;
-
-  const reactScripts = $('script[src*="react"], script[src*="react-dom"]');
-  const isReactScriptPresent = reactScripts.length > 0;
-
-  const inlineReactScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return (
-      scriptContent.includes('React.createElement') ||
-      scriptContent.includes('react.production.min.js')
-    );
-  });
-  const isInlineReactPresent = inlineReactScripts.length > 0;
-
-  const isReactScriptContentPresent = await containsInScripts(
-    $,
-    'React.createElement',
-    baseUrl,
-    ['react.production.min.js', '@license React', 'reactjs.org']
-  );
-
-  const hasBlankRootDiv = $('div#root').length > 0 && ($('div#root').html()?.trim() || '') === '';
-
-  const conditions = [
-    hasDataReactAttribute,
-    isReactScriptPresent,
-    isInlineReactPresent,
-    isReactScriptContentPresent,
-    hasBlankRootDiv,
-  ];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const attrs = $('[data-reactroot], [data-reactid]').length > 0;
+  const hasTags = $('script[src*="react"], script[src*="react-dom"]').length > 0;
+  const inline = $('script').filter((i, el) => /React\.createElement|react\.production\.min\.js/.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /React\.createElement|@license React|reactjs\.org/.test(t));
+  const blankRoot = $('div#root').length > 0 && (($('div#root').html() || '').trim() === '');
+  return [attrs, hasTags, inline, inScripts, blankRoot].some(Boolean);
 };
 
-
 const containsVue = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const vueScripts = $('script[src*="vue"], script[src*="vue-router"]');
-  const isVueScriptPresent = vueScripts.length > 0;
-
-  const inlineVueScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('new Vue(') || scriptContent.includes('Vue.component');
-  });
-  const isInlineVuePresent = inlineVueScripts.length > 0;
-
-  const hasDataVAttributes = $('[data-v-]').length > 0;
-
-  const isVueScriptContentPresent = await containsInScripts(
-    $,
-    'Vue.component',
-    baseUrl,
-    ['Vue.config', 'vuejs.org']
-  );
-
-  const conditions = [
-    isVueScriptPresent,
-    isInlineVuePresent,
-    hasDataVAttributes,
-    isVueScriptContentPresent,
-  ];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTags = $('script[src*="vue"], script[src*="vue-router"]').length > 0;
+  const inline = $('script').filter((i, el) => /new Vue\(|Vue\.component/.test($(el).html() || '')).length > 0;
+  const hasDataV = $('[data-v-]').length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /Vue\.component|Vue\.config|vuejs\.org/.test(t));
+  return hasTags || inline || hasDataV || inScripts;
 };
 
 const containsNuxtJs = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const nuxtScripts = $('script[src*="/_nuxt/"]');
-  const isNuxtScriptPresent = nuxtScripts.length > 0;
-
-  const inlineNuxtScripts = $('script').filter(
-    (i, el) => $(el).html()?.includes('nuxt.config.js') ?? false
-  );
-  const isInlineNuxtPresent = inlineNuxtScripts.length > 0;
-
-  const isNuxtScriptContentPresent = await containsInScripts($, '/_nuxt/', baseUrl);
-
-  const hasNuxtData = $('script#nuxt-config').length > 0;
-
-  const conditions = [isNuxtScriptPresent, isInlineNuxtPresent, isNuxtScriptContentPresent, hasNuxtData];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTags = $('script[src*="/_nuxt/"]').length > 0 || $('script#nuxt-config').length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /\/_nuxt\//.test(t));
+  return hasTags || inScripts;
 };
 
 const containsAngular = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const angularScripts = $('script[src*="main.js"], script[src*="polyfills.js"]');
-  const hasNgApp = $('[ng-app]').length > 0;
-  const isAngularScriptContentPresent = await containsInScripts(
-    $,
-    'platformBrowserDynamic',
-    baseUrl,
-    ['@angular']
-  );
-
-  const conditions = [angularScripts.length > 0, hasNgApp, isAngularScriptContentPresent];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTags = $('script[src*="main.js"], script[src*="polyfills.js"]').length > 0 || $('[ng-app]').length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /platformBrowserDynamic|@angular/.test(t));
+  return hasTags || inScripts;
 };
 
 const containsPolymer = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const polymerScripts = $('script[src*="polymer"]');
-  const hasPolymerElements = $('[is]').length > 0;
-
-  const inlinePolymerScripts = $('script').filter((i, el) => {
-    const scriptContent = $(el).html() || '';
-    return scriptContent.includes('Polymer') && scriptContent.includes('customElements');
-  });
-  const isInlinePolymerPresent = inlinePolymerScripts.length > 0;
-
-  const isPolymerScriptContentPresent = await containsInScripts(
-    $,
-    'Polymer',
-    baseUrl,
-    ['polymer-project.org', 'webcomponentsjs']
-  );
-
-  const conditions = [
-    polymerScripts.length > 0,
-    hasPolymerElements,
-    isInlinePolymerPresent,
-    isPolymerScriptContentPresent,
-  ];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTag = $('script[src*="polymer"]').length > 0 || $('[is]').length > 0;
+  const inline = $('script').filter((i, el) => /Polymer.*customElements/.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /Polymer|polymer-project\.org|webcomponentsjs/.test(t));
+  return hasTag || inline || inScripts;
 };
 
 const containsGatsby = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const gatsbyScripts = $('script[src*="/gatsby"], script[src*="webpack-runtime"]');
-  const isGatsbyScriptPresent = gatsbyScripts.length > 0;
-
-  const inlineGatsbyScripts = $('script').filter(
-    (i, el) => $(el).html()?.includes('gatsby') ?? false
-  );
-  const isInlineGatsbyPresent = inlineGatsbyScripts.length > 0;
-
-  const isGatsbyScriptContentPresent = await containsInScripts($, 'gatsby', baseUrl);
-
-  const hasGatsbyData = $('link[rel="gatsby"]').length > 0;
-
-  const conditions = [
-    isGatsbyScriptPresent,
-    isInlineGatsbyPresent,
-    isGatsbyScriptContentPresent,
-    hasGatsbyData,
-  ];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTags = $('script[src*="/gatsby"], script[src*="webpack-runtime"]').length > 0 || $('link[rel="gatsby"]').length > 0;
+  const inline = $('script').filter((i, el) => /gatsby/i.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /gatsby/i.test(t));
+  return hasTags || inline || inScripts;
 };
 
 const containsSvelte = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const svelteScripts = $('script[src*="svelte"]');
-  const isSvelteScriptPresent = svelteScripts.length > 0;
-
-  const inlineSvelteScripts = $('script').filter(
-    (i, el) => $(el).html()?.includes('SvelteComponent') ?? false
-  );
-  const isInlineSveltePresent = inlineSvelteScripts.length > 0;
-
-  const isSvelteScriptContentPresent = await containsInScripts($, 'SvelteComponent', baseUrl);
-
-  const hasSvelteData = $('svelte-head').length > 0;
-
-  const conditions = [
-    isSvelteScriptPresent,
-    isInlineSveltePresent,
-    isSvelteScriptContentPresent,
-    hasSvelteData,
-  ];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTags = $('script[src*="svelte"]').length > 0 || $('svelte-head').length > 0;
+  const inline = $('script').filter((i, el) => /SvelteComponent/.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /SvelteComponent/.test(t));
+  return hasTags || inline || inScripts;
 };
 
 const containsEmber = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const emberScripts = $(
-    'script[src*="ember"], script[src*="ember.debug"], script[src*="ember.prod"]'
-  );
-  const isEmberScriptPresent = emberScripts.length > 0;
-
-  const inlineEmberScripts = $('script').filter((i, el) =>
-    $(el).html()?.includes('Ember.Application.create') ?? false
-  );
-  const isInlineEmberPresent = inlineEmberScripts.length > 0;
-
-  const isEmberScriptContentPresent = await containsInScripts(
-    $,
-    'Ember.Application.create',
-    baseUrl
-  );
-
-  const hasEmberData = $('[id^="ember"]').length > 0;
-
-  const conditions = [
-    isEmberScriptPresent,
-    isInlineEmberPresent,
-    isEmberScriptContentPresent,
-    hasEmberData,
-  ];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTags = $('script[src*="ember"]').length > 0 || $('[id^="ember"]').length > 0;
+  const inline = $('script').filter((i, el) => /Ember\.Application\.create/.test($(el).html() || '')).length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /Ember\.Application\.create/.test(t));
+  return hasTags || inline || inScripts;
 };
 
 const containsMaterialUI = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
-  const muiScripts = $(
-    'script[src*="material-ui"], script[src*="mui"], script[src*="MuiSvgIcon"], script[src*="muiName"]'
-  );
-  const isMUIScriptPresent = muiScripts.length > 0;
-
-  const isMUIScriptContentPresent = await containsInScripts(
-    $,
-    '@mui',
-    baseUrl,
-    ['MuiSvgIcon', 'muiName']
-  );
-
-  const hasMuiClasses = $('[class*="Mui"]').length > 0;
-
-  const conditions = [isMUIScriptPresent, isMUIScriptContentPresent, hasMuiClasses];
-  const trueConditions = conditions.filter(Boolean).length;
-
-  return trueConditions >= 2;
+  const hasTag = $('script[src*="material-ui"], script[src*="mui"]').length > 0 || $('[class*="Mui"]').length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /@mui|MuiSvgIcon|muiName/.test(t));
+  return hasTag || inScripts;
 };
 
+// Newer/lightweight libs
+const containsAstro = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
+  const hasIslands = $('astro-island, [data-astro-cid]').length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /astro\/client|astro-island|astro\.client/i.test(t));
+  return hasIslands || inScripts;
+};
+const containsRemix = async ($: cheerio.Root, baseUrl: string): Promise<boolean> => {
+  const hasTag = $('script[data-remix-run], script[type="module"][src*="/build/"]').length > 0;
+  const inScripts = await containsInScripts($, baseUrl, (t) => /__remixManifest|remix:/i.test(t));
+  return hasTag || inScripts;
+};
+const containsAlpine = ($: cheerio.Root): boolean => {
+  const hasAttrs = $('[x-data], [x-init], [x-show], [x-on\\:], [x-bind\\:]').length > 0;
+  const hasScript = $('script[src*="alpinejs"]').length > 0;
+  return hasAttrs || hasScript;
+};
+const containsHTMX = ($: cheerio.Root): boolean => {
+  const hasAttrs = $('[hx-get], [hx-post], [hx-target], [hx-swap]').length > 0;
+  const hasScript = $('script[src*="htmx.org"]').length > 0;
+  return hasAttrs || hasScript;
+};
+
+// ======= CDN / hosting inference =======
+const inferCDN = (headers: Record<string, string>): string[] => {
+  const h: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) h[k.toLowerCase()] = String(v || '');
+  const out = new Set<string>();
+
+  if (h['cf-ray'] || h['cf-cache-status'] || /cloudflare/i.test(h['server'] || '')) out.add('Cloudflare');
+  if (h['x-amz-cf-pop'] || h['via']?.toLowerCase().includes('cloudfront')) out.add('Amazon CloudFront');
+  if (h['x-served-by']?.toLowerCase().includes('fastly') || /fastly/i.test(h['server'] || '')) out.add('Fastly');
+  if (/akamai/i.test(h['server'] || '') || h['x-akamai-transformed'] || h['x-akamai-staging']) out.add('Akamai');
+  if (h['server']?.toLowerCase().includes('vercel') || h['x-vercel-id']) out.add('Vercel Edge');
+  if (h['x-cache']?.toLowerCase().includes('cache') && h['x-azure-ref']) out.add('Azure CDN/Front Door');
+  return Array.from(out);
+};
+
+const inferHosting = (headers: Record<string, string>): string | undefined => {
+  const h: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) h[k.toLowerCase()] = String(v || '');
+  if (h['x-vercel-id'] || /vercel/i.test(h['server'] || '')) return 'Vercel';
+  if (h['x-nf-request-id'] || /netlify/i.test(h['server'] || '')) return 'Netlify';
+  if (h['x-github-request-id'] || /github\.com/i.test(h['server'] || '')) return 'GitHub Pages';
+  if (h['fly-request-id'] || /fly\.io/i.test(h['server'] || '')) return 'Fly.io';
+  if (h['x-render-origin-server'] || /render/i.test(h['server'] || '')) return 'Render';
+  if (h['server']?.toLowerCase().includes('azure')) return 'Azure';
+  if (h['server']?.toLowerCase().includes('google')) return 'Google Cloud';
+  return undefined;
+};
+
+// ======= API Route =======
 export async function POST(req: NextRequest) {
   try {
     const { url } = await req.json();
 
-    if (!url) {
+    if (!url || typeof url !== 'string') {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
     }
 
+    let response;
     try {
-      const response = await axios.get(url, {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)',
-        },
+      response = await http.get(url, {
+        validateStatus: () => true,
       });
-      const headers = Object.fromEntries(
-        Object.entries(response.headers).map(([key, value]) => [key, value?.toString() || ''])
-      );
-      const techStack = await detectTechStack(response.data, headers, url);
-
-      return NextResponse.json(techStack, { status: 200 });
-    } catch (error) {
-      console.error('Error fetching the URL:', error);
-      if (axios.isAxiosError(error) && error.response?.status === 403) {
-        return NextResponse.json(
-          { error: 'Access to the URL is forbidden (403).' },
-          { status: 403 }
-        );
-      }
-      return NextResponse.json({ error: 'Error analyzing the website' }, { status: 500 });
+    } catch (e) {
+      console.error('Network error fetching URL:', e);
+      return NextResponse.json({ error: 'Error fetching the URL' }, { status: 502 });
     }
+
+    if (response.status === 403) {
+      return NextResponse.json({ error: 'Access to the URL is forbidden (403).' }, { status: 403 });
+    }
+    if (response.status >= 400) {
+      return NextResponse.json({ error: `Target responded with ${response.status}` }, { status: 400 });
+    }
+
+    const headers: Record<string, string> = Object.fromEntries(
+      Object.entries(response.headers).map(([k, v]) => [k.toLowerCase(), Array.isArray(v) ? v.join(', ') : String(v ?? '')])
+    );
+
+    const tech = await detectTechStack(String(response.data || ''), headers, url);
+    return NextResponse.json(tech, { status: 200 });
   } catch (error) {
     console.error('Error parsing request body:', error);
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
